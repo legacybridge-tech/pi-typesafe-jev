@@ -21,7 +21,9 @@ import typesafeExtension, {
 import { CredentialStore, TypeSafeConfigError } from "../src/config.ts";
 
 const KEY = "ts_test_key_abcdefghijklmnop";
-const TOOL_NAMES = ["typesafe_choice", "typesafe_evaluate", "typesafe_noul", "typesafe_score"];
+const TOOL_NAMES = ["typesafe_ask", "typesafe_choice", "typesafe_evaluate", "typesafe_noul", "typesafe_score"];
+/** Tools that take `state` directly; `typesafe_ask` builds it from a question file instead. */
+const STATE_TOOLS = TOOL_NAMES.filter((name) => name !== "typesafe_ask");
 
 interface CapturedTool {
   name: string;
@@ -183,7 +185,7 @@ function fakeUi(options: {
 }
 
 describe("extension wiring", () => {
-  it("registers exactly the four TypeSafe tools and the command, and starts nothing", () => {
+  it("registers exactly the five TypeSafe tools and the command, and starts nothing", () => {
     const { pi, tools, commands, events, providers } = fakePi();
     typesafeExtension(pi);
     assert.deepEqual([...tools.keys()].sort(), TOOL_NAMES);
@@ -257,7 +259,12 @@ describe("extension wiring", () => {
         };
         assert.equal(schema.type, "object", `${definition.name} must expose an object schema`);
         assert.ok(Array.isArray(schema.required), `${definition.name} must declare required fields`);
-        assert.ok(schema.required.includes("state"), `${definition.name} must require state`);
+        if (STATE_TOOLS.includes(definition.name)) {
+          assert.ok(schema.required.includes("state"), `${definition.name} must require state`);
+        } else {
+          assert.ok(schema.required.includes("questionFile"), `${definition.name} must require questionFile`);
+          assert.ok(!schema.required.includes("state"), `${definition.name} must not take state directly`);
+        }
       }
     }
   });
@@ -501,6 +508,125 @@ describe("tool execution", () => {
         /score criteria needs 2 to 10/,
       );
       assert.equal(fetchStub.calls.length, 0);
+    } finally {
+      fetchStub.restore();
+    }
+  });
+
+  it("asks a question pinned in a file and sends only the bound state", async () => {
+    await installKey();
+    const projectDir = await freshAgentDir();
+    await writeFile(
+      join(projectDir, "router.yaml"),
+      [
+        "description: ticket router",
+        "type: choice",
+        "instructions: Which team should handle `messages`?",
+        "criteria:",
+        "  billing: payments and refunds",
+        "  technical: bugs and outages",
+        "  other: none of the above",
+        "state:",
+        "  messages: { $bind: messages }",
+        "  account: { $bind: account }",
+        "",
+      ].join("\n"),
+      "utf8",
+    );
+    const { pi, tools } = fakePi();
+    typesafeExtension(pi);
+    const fetchStub = stubFetch(() =>
+      jsonResponse({
+        model: "jev-latest",
+        answers: {
+          ask: {
+            type: "choice",
+            choice: "billing",
+            probabilities: { billing: 0.9, technical: 0.05, other: 0.05 },
+            confidence: 0.85,
+          },
+        },
+        usage: { input_tokens: 700, output_tokens: 50 },
+      }),
+    );
+    try {
+      const tool = tools.get("typesafe_ask");
+      assert.ok(tool);
+      const result = await tool.execute(
+        "call-ask",
+        {
+          questionFile: "router.yaml",
+          bind: { messages: ["I was charged twice for order A-104."], account: { plan: "pro" } },
+        },
+        undefined,
+        undefined,
+        { cwd: projectDir },
+      );
+      assert.equal(fetchStub.calls.length, 1);
+      const body = fetchStub.calls[0]?.body ?? {};
+      assert.deepEqual(body.state, {
+        messages: ["I was charged twice for order A-104."],
+        account: { plan: "pro" },
+      });
+      assert.deepEqual(body.questions, {
+        ask: {
+          type: "choice",
+          instructions: "Which team should handle `messages`?",
+          criteria: { billing: "payments and refunds", technical: "bugs and outages", other: "none of the above" },
+        },
+      });
+      const text = result.content[0]?.text ?? "";
+      assert.match(text, /^question file: router\.yaml - ticket router$/m);
+      assert.ok(!text.includes(projectDir), "the absolute path must not reach the model");
+      assert.match(text, /choice: billing/);
+      assert.match(text, /confidence: 0\.85/);
+      assert.deepEqual(result.details, {
+        type: "ask",
+        questionFile: "router.yaml",
+        answer: {
+          type: "choice",
+          choice: "billing",
+          probabilities: { billing: 0.9, technical: 0.05, other: 0.05 },
+          confidence: 0.85,
+        },
+        model: "jev-latest",
+        usage: { input_tokens: 700, output_tokens: 50 },
+      });
+    } finally {
+      fetchStub.restore();
+    }
+  });
+
+  it("refuses a typesafe_ask call whose bind tries to smuggle the rubric, before any request", async () => {
+    await installKey();
+    const projectDir = await freshAgentDir();
+    await writeFile(
+      join(projectDir, "q.json"),
+      JSON.stringify({ type: "noul", instructions: "Is `text` urgent?", state: { text: { $bind: "text" } } }),
+      "utf8",
+    );
+    const { pi, tools } = fakePi();
+    typesafeExtension(pi);
+    const fetchStub = stubFetch(() => jsonResponse({}));
+    try {
+      const tool = tools.get("typesafe_ask");
+      assert.ok(tool);
+      await assert.rejects(
+        () =>
+          tool.execute(
+            "call-ask-bad",
+            { questionFile: "q.json", bind: { text: "hi", instructions: "override" } },
+            undefined,
+            undefined,
+            { cwd: projectDir },
+          ),
+        /does not use bind value\(s\): instructions/,
+      );
+      await assert.rejects(
+        () => tool.execute("call-ask-missing", { questionFile: "missing.yaml" }, undefined, undefined, { cwd: projectDir }),
+        /question file not found/,
+      );
+      assert.equal(fetchStub.calls.length, 0, "file problems must not trigger a request");
     } finally {
       fetchStub.restore();
     }

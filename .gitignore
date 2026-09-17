@@ -13,6 +13,7 @@ npm-debug.log*
 # Local scratch space for experiments; never part of the package (see "files" in package.json).
 /scratch/
 /tmp/
+/.dag/
 
 # Never commit stored credentials. The real key lives in the pi agent directory
 # (<agent dir>/typesafe/config.json), so this only guards against someone pointing

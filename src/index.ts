@@ -5,6 +5,7 @@
  *   typesafe_choice    pick one option from a fixed set
  *   typesafe_score     rate along ordered levels
  *   typesafe_evaluate  batch several typed questions over one state
+ *   typesafe_ask       ask a question pinned in a YAML/JSON file, binding only the facts
  *
  * `/typesafe setup|status|logout` manages the API key stored by config.ts.
  *
@@ -40,6 +41,7 @@ import {
   TYPESAFE_CONFIG_DIR_NAME,
   validateApiKey,
 } from "./config.ts";
+import { ASK_QUESTION_ID, bindState, loadQuestionFile } from "./question-file.ts";
 
 const NOUL_QUESTION_ID = "noul";
 const CHOICE_QUESTION_ID = "choice";
@@ -134,6 +136,20 @@ const EvaluateParams = Type.Object({
   }),
 });
 
+const AskParams = Type.Object({
+  questionFile: Type.String({
+    minLength: 1,
+    description:
+      "Path to a .yaml, .yml, or .json question file. Relative paths resolve against the current working directory; ~ expands to the home directory. The file pins type, instructions, criteria, and a state template; the tool call cannot override them.",
+  }),
+  bind: Type.Optional(
+    Type.Record(Type.String(), Type.Unknown(), {
+      description:
+        "Values for every { $bind: name } slot in the file's state template, keyed by slot name. Supply exactly the slots the template declares: a missing or unused name is an error. Omit when the template has no slots.",
+    }),
+  ),
+});
+
 export interface NoulToolDetails {
   type: "noul";
   noul: number;
@@ -167,11 +183,20 @@ export interface EvaluateToolDetails {
   usage: TokenUsage;
 }
 
+export interface AskToolDetails {
+  type: "ask";
+  questionFile: string;
+  answer: Answer;
+  model: string;
+  usage: TokenUsage;
+}
+
 export type TypeSafeToolDetails =
   | NoulToolDetails
   | ChoiceToolDetails
   | ScoreToolDetails
-  | EvaluateToolDetails;
+  | EvaluateToolDetails
+  | AskToolDetails;
 
 /** Minimal UI surface used by `/typesafe`, so tests can supply a fake. */
 export interface TypeSafeCommandUi {
@@ -596,6 +621,58 @@ export default function typesafeExtension(pi: ExtensionAPI): void {
           model: response.model,
           usage: response.usage,
         } satisfies EvaluateToolDetails,
+      };
+    },
+  });
+
+  pi.registerTool({
+    name: "typesafe_ask",
+    label: "TypeSafe Ask",
+    description:
+      "Ask TypeSafe/Jev a question that is pinned in a local YAML or JSON question file, supplying only the facts that change per call. The file fixes type (noul, choice, or score), instructions, criteria, and a state template with { $bind: name } slots; bind fills those slots. Use this for a recurring judgment such as a router or classifier so the rubric stays identical across calls and is not re-typed each time. Requires an API key stored with /typesafe setup.",
+    promptSnippet: "Ask a question pinned in a local question file, binding only the per-call facts",
+    promptGuidelines: [
+      "Use typesafe_ask instead of typesafe_noul, typesafe_choice, or typesafe_score whenever the same question will be asked repeatedly; keep the rubric in the file and pass only bind values.",
+      "typesafe_ask takes the question text, options, and levels from the file only; do not paste instructions or criteria into bind, and do not try to override them from the call.",
+      "Give typesafe_ask exactly the bind names the file's state template declares; a missing or extra name is an error, not a warning.",
+      "Read a typesafe_ask result the same way as the underlying type: a noul is the probability of yes, a choice carries probabilities and confidence, and a score is a 0-based position across the file's levels.",
+      "If typesafe_ask reports a missing or rejected API key, tell the user to run /typesafe setup; never ask for the key in chat.",
+    ],
+    parameters: AskParams,
+    async execute(_toolCallId, params, signal, _onUpdate, ctx) {
+      const cwd = typeof ctx?.cwd === "string" && ctx.cwd.length > 0 ? ctx.cwd : process.cwd();
+      const file = await loadQuestionFile(params.questionFile, cwd);
+      const state = bindState(file, params.bind);
+      const response = await askTypeSafe(
+        state,
+        [
+          {
+            id: ASK_QUESTION_ID,
+            type: file.question.type,
+            instructions: file.question.instructions,
+            criteria: file.question.criteria,
+          },
+        ],
+        signal,
+      );
+      const answer = answerFor(response, ASK_QUESTION_ID, file.question.type);
+      const header = file.description ? `${file.path} - ${file.description}` : file.path;
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: boundedText(
+              [`question file: ${header}`, `type: ${answer.type}`, ...answerLines(answer), usageLine(response)].join("\n"),
+            ),
+          },
+        ],
+        details: {
+          type: "ask" as const,
+          questionFile: file.path,
+          answer,
+          model: response.model,
+          usage: response.usage,
+        } satisfies AskToolDetails,
       };
     },
   });

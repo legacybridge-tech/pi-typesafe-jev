@@ -1,6 +1,6 @@
 # pi-typesafe-jev
 
-A pi extension that exposes TypeSafe (Jev, System One) judgments as four pi tools, so a model can
+A pi extension that exposes TypeSafe (Jev, System One) judgments as five pi tools, so a model can
 make narrow semantic judgments while your code and your users keep control of thresholds, weights,
 and actions.
 
@@ -10,6 +10,7 @@ and actions.
 | `typesafe_choice` | Pick one of a fixed set of options | `choice`, `probabilities`, `confidence` |
 | `typesafe_score` | Rate along ordered levels | `score`, `legend`, `probabilities`, `confidence` |
 | `typesafe_evaluate` | Several independent questions over one state, in one request | One answer per question, plus `usage` |
+| `typesafe_ask` | A question pinned in a local YAML/JSON file; the call supplies only the per-call facts | The pinned question's answer (`noul`, `choice`, or `score` shape) |
 
 The tools call `POST https://api.typesafe.ai/v1/systemone` directly with native `fetch`; there is no
 SDK runtime dependency. The API key is stored by `/typesafe setup` in your own pi agent directory and
@@ -183,6 +184,62 @@ Several independent questions in one request (mixed types):
 
 Tool output includes the answers, the full probability distributions, `confidence`, and token
 `usage`; the `details` field carries the same structured data.
+
+### Question files (`typesafe_ask`)
+
+When the same judgment is asked repeatedly (a router, a classifier, a gate), the rubric should not be
+re-typed by the calling model on every call: that costs output tokens and invites the model to
+"helpfully" rewrite the criteria. `typesafe_ask` reads the question from a file on disk and takes only
+the facts that change from the tool call.
+
+`ticket_router.yaml`:
+
+```yaml
+description: which team should handle the latest ticket message
+type: choice
+instructions: |
+  Which team should handle the request in `messages` (newest last),
+  given the `account` facts?
+criteria:
+  billing: Payments, invoicing, refunds.
+  technical: Bugs, outages, integrations.
+  sales: Pricing, upgrades, new contracts.
+  other: None of the above.
+state:
+  messages: { $bind: messages }
+  account: { $bind: account }
+  refund_policy: "Duplicate charges are eligible for a refund."
+```
+
+Tool call:
+
+```json
+{
+  "questionFile": "ticket_router.yaml",
+  "bind": {
+    "messages": ["I was charged twice for order A-104."],
+    "account": { "plan": "pro", "open_incidents": 0 }
+  }
+}
+```
+
+Rules:
+
+- The file is the question. `type`, `instructions`, and `criteria` come from the file only; the call
+  cannot override them, and a `bind` name that the template does not use is an error.
+- `state` is a template. Every `{ $bind: name }` node is replaced by `bind.name`; every other node is
+  copied as-is. Slots may appear anywhere in the template, including inside arrays or as the root.
+- Every slot must be supplied and every supplied name must be a slot. Both directions fail loudly so a
+  typo cannot silently drop a fact.
+- `questionFile` may be relative (resolved against the current working directory), absolute, or
+  `~/...`. Only `.yaml`, `.yml`, and `.json` are accepted; the file must be a regular file (symbolic
+  links are refused) under 256 KiB, and YAML anchors/aliases and merge keys are not expanded.
+- Tool output, `details.questionFile`, and error messages show the path relative to the working
+  directory (or `~/...`, or just the file name for files elsewhere), never the absolute path, so the OS
+  user name and directory layout stay out of model context and session files.
+- An optional top-level `description` is echoed in the tool output; any other top-level key is an error.
+- The question is validated through the same normalizer as the ad-hoc tools, so the wire request is
+  identical to a `typesafe_choice` (or noul / score) call with the same content.
 
 ## How to read the results (embedded in the tool descriptions and guidelines)
 
