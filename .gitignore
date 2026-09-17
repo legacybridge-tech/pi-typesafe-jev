@@ -1,0 +1,20 @@
+# Dependencies installed for local development (peer dependencies are provided by pi).
+node_modules/
+
+# Package tarballs produced by `npm pack` while inspecting the published file set.
+*.tgz
+*.tar.gz
+
+# Logs and OS/editor noise.
+*.log
+npm-debug.log*
+.DS_Store
+
+# Local scratch space for experiments; never part of the package (see "files" in package.json).
+/scratch/
+/tmp/
+
+# Never commit stored credentials. The real key lives in the pi agent directory
+# (<agent dir>/typesafe/config.json), so this only guards against someone pointing
+# PI_CODING_AGENT_DIR or a test fixture at the repository.
+**/typesafe/config.json
